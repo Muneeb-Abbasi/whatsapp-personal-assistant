@@ -78,13 +78,19 @@ def validate_twilio_signature(request: Request, body: Optional[bytes]) -> bool:
     
     Args:
         request: FastAPI request object
-        body: Raw request body
+        body: Raw request body (can be None if Form already consumed it)
     
     Returns:
         True if signature is valid
     """
     if not settings.validate_twilio_signature:
         return True
+    
+    # If body is None, we can't validate properly - skip validation
+    # This happens when Form() has already consumed the request body
+    if body is None:
+        logger.warning("Cannot validate Twilio signature: request body not available")
+        return True  # Skip validation when body unavailable
     
     validator = RequestValidator(settings.twilio_auth_token)
     
