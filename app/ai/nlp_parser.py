@@ -7,7 +7,8 @@ import logging
 from datetime import datetime
 from typing import Optional
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, APIError, APITimeoutError, RateLimitError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config.settings import get_settings
 from app.domain.reminder import ParsedIntent
@@ -66,6 +67,33 @@ Examples:
 """
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((APIError, APITimeoutError, RateLimitError)),
+    reraise=True
+)
+async def _call_openai_chat(messages: list, response_format: dict) -> str:
+    """
+    Make an OpenAI chat completion call with retry logic.
+    
+    Args:
+        messages: Chat messages
+        response_format: Response format specification
+    
+    Returns:
+        Response content string
+    """
+    response = await openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        response_format=response_format,
+        temperature=0.1,
+        max_tokens=500
+    )
+    return response.choices[0].message.content
+
+
 async def parse_user_message(message: str) -> ParsedIntent:
     """
     Parse a user message to extract intent and entities.
@@ -79,8 +107,7 @@ async def parse_user_message(message: str) -> ParsedIntent:
     current_time = get_current_time_pkt()
     
     try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        result_text = await _call_openai_chat(
             messages=[
                 {
                     "role": "system",
@@ -93,13 +120,10 @@ async def parse_user_message(message: str) -> ParsedIntent:
                     "content": message
                 }
             ],
-            response_format={"type": "json_object"},
-            temperature=0.1,  # Low temperature for consistent parsing
-            max_tokens=500
+            response_format={"type": "json_object"}
         )
         
         # Parse the JSON response
-        result_text = response.choices[0].message.content
         result = json.loads(result_text)
         
         logger.info(f"Parsed intent: {result.get('intent')}")
@@ -131,12 +155,43 @@ async def parse_user_message(message: str) -> ParsedIntent:
             intent="unknown",
             response_message="I'm sorry, I had trouble understanding that. Could you try rephrasing?"
         )
+    except (APIError, APITimeoutError, RateLimitError) as e:
+        logger.error(f"OpenAI API error after retries: {e}")
+        return ParsedIntent(
+            intent="unknown",
+            response_message="I'm having trouble connecting to my AI service. Please try again in a moment."
+        )
     except Exception as e:
         logger.exception(f"Error parsing message: {e}")
         return ParsedIntent(
             intent="unknown",
             response_message="I encountered an error processing your message. Please try again."
         )
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((APIError, APITimeoutError, RateLimitError)),
+    reraise=True
+)
+async def _call_openai_generate(messages: list) -> str:
+    """
+    Make an OpenAI chat completion call for response generation with retry logic.
+    
+    Args:
+        messages: Chat messages
+    
+    Returns:
+        Response content string
+    """
+    response = await openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.7,
+        max_tokens=150
+    )
+    return response.choices[0].message.content.strip()
 
 
 async def generate_smart_response(context: str, action_result: str) -> str:
@@ -151,8 +206,7 @@ async def generate_smart_response(context: str, action_result: str) -> str:
         Natural language response string
     """
     try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        return await _call_openai_generate(
             messages=[
                 {
                     "role": "system",
@@ -162,12 +216,8 @@ async def generate_smart_response(context: str, action_result: str) -> str:
                     "role": "user",
                     "content": f"User request: {context}\nAction taken: {action_result}\n\nGenerate a brief, friendly confirmation message."
                 }
-            ],
-            temperature=0.7,
-            max_tokens=150
+            ]
         )
-        
-        return response.choices[0].message.content.strip()
         
     except Exception as e:
         logger.error(f"Error generating response: {e}")

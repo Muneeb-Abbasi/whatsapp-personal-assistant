@@ -1,5 +1,5 @@
 """
-Audio handler for downloading and processing WhatsApp voice messages.
+Audio handler for downloading and processing WhatsApp voice messages with retry logic.
 """
 
 import logging
@@ -8,12 +8,40 @@ import os
 from typing import Optional
 
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config.settings import get_settings
 from app.ai.speech_to_text import transcribe_audio, transcribe_audio_bytes
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
+    reraise=True
+)
+async def _download_media_with_retry(client: httpx.AsyncClient, media_url: str) -> bytes:
+    """
+    Download media with retry logic.
+    
+    Args:
+        client: HTTP client
+        media_url: URL to download
+    
+    Returns:
+        Downloaded bytes
+    """
+    response = await client.get(
+        media_url,
+        auth=(settings.twilio_account_sid, settings.twilio_auth_token),
+        follow_redirects=True,
+        timeout=30.0
+    )
+    response.raise_for_status()
+    return response.content
 
 
 async def download_and_transcribe_audio(
@@ -54,7 +82,7 @@ async def download_and_transcribe_audio(
 
 async def download_twilio_media(media_url: str) -> Optional[bytes]:
     """
-    Download media from Twilio URL with authentication.
+    Download media from Twilio URL with authentication and retry logic.
     
     Args:
         media_url: Twilio media URL
@@ -64,20 +92,13 @@ async def download_twilio_media(media_url: str) -> Optional[bytes]:
     """
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                media_url,
-                auth=(settings.twilio_account_sid, settings.twilio_auth_token),
-                follow_redirects=True,
-                timeout=30.0
-            )
-            
-            if response.status_code == 200:
-                logger.info(f"Downloaded audio: {len(response.content)} bytes")
-                return response.content
-            else:
-                logger.error(f"Failed to download audio: {response.status_code}")
-                return None
+            content = await _download_media_with_retry(client, media_url)
+            logger.info(f"Downloaded audio: {len(content)} bytes")
+            return content
                 
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        logger.error(f"Failed to download audio after retries: {e}")
+        return None
     except Exception as e:
         logger.exception(f"Error downloading audio: {e}")
         return None

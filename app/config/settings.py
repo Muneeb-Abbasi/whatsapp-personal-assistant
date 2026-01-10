@@ -23,8 +23,13 @@ class Settings(BaseSettings):
     user_whatsapp_number: str  # Format: whatsapp:+923001234567
     user_phone_number: str  # For receiving calls
     
-    # Database
-    database_url: str = "sqlite+aiosqlite:///./reminders.db"
+    # Database - Use DATA_DIR for Railway persistent volume
+    data_dir: str = "."
+    
+    @property
+    def database_url(self) -> str:
+        """Database URL with support for Railway persistent volumes."""
+        return f"sqlite+aiosqlite:///{self.data_dir}/reminders.db"
     
     # Application Settings
     debug: bool = False

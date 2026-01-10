@@ -28,3 +28,10 @@ pydub==0.25.1
 
 # Date/time parsing
 python-dateutil==2.8.2
+
+# Retry logic
+tenacity==8.2.3
+
+# Testing
+pytest>=9.0.0
+pytest-asyncio>=1.0.0

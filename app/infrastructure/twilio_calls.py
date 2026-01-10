@@ -1,5 +1,5 @@
 """
-Twilio Voice integration for phone call reminders.
+Twilio Voice integration for phone call reminders with retry logic.
 """
 
 import logging
@@ -8,6 +8,7 @@ from typing import Optional
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
 from twilio.twiml.voice_response import VoiceResponse
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config.settings import get_settings
 
@@ -16,6 +17,33 @@ settings = get_settings()
 
 # Initialize Twilio client
 twilio_client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type(TwilioRestException),
+    reraise=True
+)
+def _make_call_sync(twiml: str, to_number: str, from_number: str, timeout: int):
+    """
+    Synchronous Twilio call with retry logic.
+    
+    Args:
+        twiml: TwiML content for the call
+        to_number: Recipient phone number
+        from_number: Caller phone number
+        timeout: Ring timeout in seconds
+    
+    Returns:
+        Twilio call object
+    """
+    return twilio_client.calls.create(
+        twiml=twiml,
+        to=to_number,
+        from_=from_number,
+        timeout=timeout,
+    )
 
 
 async def make_reminder_call(reminder_title: str, to_number: str = None) -> bool:
@@ -36,18 +64,18 @@ async def make_reminder_call(reminder_title: str, to_number: str = None) -> bool
         # Generate TwiML for the call
         twiml = generate_reminder_twiml(reminder_title)
         
-        call = twilio_client.calls.create(
+        call = _make_call_sync(
             twiml=twiml,
-            to=to_number,
-            from_=settings.twilio_phone_number,
-            timeout=30,  # Ring for 30 seconds
+            to_number=to_number,
+            from_number=settings.twilio_phone_number,
+            timeout=30
         )
         
         logger.info(f"Initiated reminder call. SID: {call.sid}")
         return True
         
     except TwilioRestException as e:
-        logger.error(f"Failed to make reminder call: {e}")
+        logger.error(f"Failed to make reminder call after retries: {e}")
         return False
     except Exception as e:
         logger.exception(f"Error making reminder call: {e}")

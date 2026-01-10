@@ -1,10 +1,11 @@
 """
-Twilio WhatsApp messaging integration.
+Twilio WhatsApp messaging integration with retry logic.
 """
 
 import logging
 from twilio.rest import Client
 from twilio.base.exceptions import TwilioRestException
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from app.config.settings import get_settings
 
@@ -13,6 +14,31 @@ settings = get_settings()
 
 # Initialize Twilio client
 twilio_client = Client(settings.twilio_account_sid, settings.twilio_auth_token)
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=5),
+    retry=retry_if_exception_type(TwilioRestException),
+    reraise=True
+)
+def _send_message_sync(message: str, from_number: str, to_number: str):
+    """
+    Synchronous Twilio message send with retry logic.
+    
+    Args:
+        message: Text message to send
+        from_number: Sender's WhatsApp number
+        to_number: Recipient's WhatsApp number
+    
+    Returns:
+        Twilio message object
+    """
+    return twilio_client.messages.create(
+        body=message,
+        from_=from_number,
+        to=to_number
+    )
 
 
 async def send_whatsapp_message(message: str, to_number: str = None) -> bool:
@@ -30,15 +56,15 @@ async def send_whatsapp_message(message: str, to_number: str = None) -> bool:
         to_number = settings.user_whatsapp_number
     
     try:
-        msg = twilio_client.messages.create(
-            body=message,
-            from_=settings.twilio_whatsapp_number,
-            to=to_number
+        msg = _send_message_sync(
+            message=message,
+            from_number=settings.twilio_whatsapp_number,
+            to_number=to_number
         )
         logger.info(f"WhatsApp message sent successfully. SID: {msg.sid}")
         return True
     except TwilioRestException as e:
-        logger.error(f"Failed to send WhatsApp message: {e}")
+        logger.error(f"Failed to send WhatsApp message after retries: {e}")
         return False
 
 

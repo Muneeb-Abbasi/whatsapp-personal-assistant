@@ -3,25 +3,73 @@ WhatsApp webhook endpoint for receiving messages from Twilio.
 """
 
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
-from fastapi import APIRouter, Request, Form, HTTPException, Depends
+from fastapi import APIRouter, Request, Form, HTTPException
 from fastapi.responses import Response
 from twilio.request_validator import RequestValidator
+from sqlalchemy import select, delete
 
 from app.config.settings import get_settings
-from app.infrastructure.database import DatabaseSession
+from app.infrastructure.database import DatabaseSession, async_session_factory
 from app.infrastructure.twilio_whatsapp import send_whatsapp_message, send_error_message
 from app.infrastructure.audio_handler import download_and_transcribe_audio
 from app.ai.nlp_parser import parse_user_message
 from app.usecases.reminder_service import ReminderService
+from app.domain.processed_message import ProcessedMessage
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 settings = get_settings()
 
-# Track processed message SIDs for idempotency
-processed_messages: set = set()
-MAX_PROCESSED_CACHE = 1000
+
+async def is_message_processed(message_sid: str) -> bool:
+    """
+    Check if a message has already been processed using SQLite.
+    
+    Args:
+        message_sid: Twilio message SID
+    
+    Returns:
+        True if message was already processed
+    """
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ProcessedMessage).where(ProcessedMessage.message_sid == message_sid)
+        )
+        return result.scalar_one_or_none() is not None
+
+
+async def mark_message_processed(message_sid: str) -> None:
+    """
+    Mark a message as processed in SQLite.
+    
+    Args:
+        message_sid: Twilio message SID
+    """
+    async with async_session_factory() as session:
+        processed_msg = ProcessedMessage(
+            message_sid=message_sid,
+            processed_at=datetime.utcnow()
+        )
+        session.add(processed_msg)
+        await session.commit()
+
+
+async def cleanup_old_processed_messages(days: int = 7) -> None:
+    """
+    Remove processed messages older than specified days.
+    Called periodically to prevent table from growing indefinitely.
+    
+    Args:
+        days: Number of days to retain messages
+    """
+    async with async_session_factory() as session:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        await session.execute(
+            delete(ProcessedMessage).where(ProcessedMessage.processed_at < cutoff)
+        )
+        await session.commit()
 
 
 def validate_twilio_signature(request: Request, body: Optional[bytes]) -> bool:
@@ -79,16 +127,13 @@ async def whatsapp_webhook(
         logger.warning(f"Invalid Twilio signature for message {MessageSid}")
         raise HTTPException(status_code=403, detail="Invalid signature")
     
-    # Idempotency check - prevent duplicate processing
-    if MessageSid in processed_messages:
+    # Idempotency check - prevent duplicate processing (persisted in SQLite)
+    if await is_message_processed(MessageSid):
         logger.info(f"Message {MessageSid} already processed, skipping")
         return Response(content="", media_type="text/xml")
     
-    # Add to processed cache (with size limit)
-    if len(processed_messages) >= MAX_PROCESSED_CACHE:
-        # Remove oldest entries (simple approach - clear half)
-        processed_messages.clear()
-    processed_messages.add(MessageSid)
+    # Mark message as processed immediately to prevent race conditions
+    await mark_message_processed(MessageSid)
     
     logger.info(f"Received message from {From}, SID: {MessageSid}")
     

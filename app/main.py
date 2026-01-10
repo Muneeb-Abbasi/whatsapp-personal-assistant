@@ -66,12 +66,12 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Add CORS middleware (useful for debugging)
+# Add CORS middleware (restricted to Twilio for production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://api.twilio.com"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
