@@ -27,13 +27,23 @@ Your task is to extract the user's intent and relevant entities from their messa
 
 Current date and time in Pakistan (PKT): {current_time}
 Current day of week: {current_day}
+Today's date: {today_date}
 
-IMPORTANT DATE RULES:
-1. "Monday" (without "next") means the UPCOMING Monday - the closest Monday in the future
-2. "next Monday" means the Monday AFTER the upcoming Monday
-3. "this Monday" means the upcoming Monday
-4. Always prefer the closest future occurrence for day names
-5. If today is Sunday and user says "Monday", it means TOMORROW (the upcoming Monday)
+CRITICAL DATE CALCULATION RULES:
+When user mentions a day name (Monday, Tuesday, etc.), calculate the date as follows:
+1. Find TODAY's day number (Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6)
+2. Find TARGET day number
+3. Calculate days_ahead = (target_day - today_day) % 7
+4. If days_ahead == 0 and time has passed, add 7 days (next week)
+5. Add days_ahead to today's date
+
+EXAMPLES (if today is {current_day} {today_date}):
+- "Thursday" means the UPCOMING Thursday = {thursday_date}
+- "tomorrow" means {tomorrow_date}
+- "Monday" means the UPCOMING Monday (could be this week or next)
+- "next Thursday" means the Thursday AFTER the upcoming Thursday
+
+IMPORTANT: "Thursday" when said on Wednesday means TOMORROW, not next week!
 
 IMPORTANT RULES:
 1. Output ONLY valid JSON, nothing else
@@ -143,6 +153,19 @@ async def parse_user_message(
     """
     current_time = get_current_time_pkt()
     
+    # Pre-calculate dates for the prompt to help GPT
+    from datetime import timedelta
+    today_date = current_time.strftime("%Y-%m-%d")
+    tomorrow_date = (current_time + timedelta(days=1)).strftime("%Y-%m-%d (%A)")
+    
+    # Calculate upcoming Thursday
+    current_weekday = current_time.weekday()  # Monday=0, Sunday=6
+    thursday_weekday = 3
+    days_until_thursday = (thursday_weekday - current_weekday) % 7
+    if days_until_thursday == 0:
+        days_until_thursday = 7  # If today is Thursday, next Thursday
+    thursday_date = (current_time + timedelta(days=days_until_thursday)).strftime("%Y-%m-%d (%A)")
+    
     # Build quoted context section
     quoted_context = ""
     if quoted_message:
@@ -157,6 +180,9 @@ async def parse_user_message(
         "content": SYSTEM_PROMPT.format(
             current_time=current_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
             current_day=current_time.strftime("%A"),
+            today_date=today_date,
+            tomorrow_date=tomorrow_date,
+            thursday_date=thursday_date,
             quoted_context=quoted_context
         )
     })
