@@ -8,6 +8,7 @@ from sqlalchemy.pool import StaticPool
 from app.config.settings import get_settings
 from app.domain.reminder import Base
 from app.domain.processed_message import ProcessedMessage  # noqa: F401 - needed for table creation
+from app.domain.conversation_history import ConversationMessage  # noqa: F401 - needed for table creation
 
 settings = get_settings()
 

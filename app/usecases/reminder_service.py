@@ -48,9 +48,12 @@ class ReminderService:
             "create_reminder": self._handle_create,
             "update_reminder": self._handle_update,
             "delete_reminder": self._handle_delete,
+            "delete_reminders": self._handle_batch_delete,
             "pause_reminder": self._handle_pause,
             "resume_reminder": self._handle_resume,
             "list_reminders": self._handle_list,
+            "get_reminder_info": self._handle_get_info,
+            "snooze_reminder": self._handle_snooze,
             "opt_out_calls": self._handle_opt_out,
             "opt_in_calls": self._handle_opt_in,
             "acknowledge": self._handle_acknowledge,
@@ -381,3 +384,145 @@ class ReminderService:
         )
         responded = result.scalar_one_or_none()
         return responded or False
+    
+    async def _handle_batch_delete(self, intent: ParsedIntent) -> str:
+        """Handle batch delete reminders intent (delete 1 & 2)."""
+        if not intent.target_indices:
+            return "Please specify which reminders to delete by number (e.g., 'delete 1 and 2')."
+        
+        # Get all active/paused reminders ordered by scheduled_time
+        result = await self.session.execute(
+            select(Reminder)
+            .where(Reminder.status.in_([ReminderStatus.ACTIVE, ReminderStatus.PAUSED]))
+            .order_by(Reminder.scheduled_time)
+        )
+        reminders = result.scalars().all()
+        
+        if not reminders:
+            return "You don't have any reminders to delete."
+        
+        deleted_titles = []
+        invalid_indices = []
+        
+        for idx in intent.target_indices:
+            # Convert 1-indexed to 0-indexed
+            if isinstance(idx, int) and 1 <= idx <= len(reminders):
+                reminder = reminders[idx - 1]
+                deleted_titles.append(reminder.title)
+                
+                # Cancel scheduled jobs
+                await cancel_reminder_jobs(reminder.id)
+                
+                # Delete the reminder
+                await self.session.delete(reminder)
+            else:
+                invalid_indices.append(idx)
+        
+        await self.session.commit()
+        
+        response = ""
+        if deleted_titles:
+            titles_str = ", ".join([f"*{t}*" for t in deleted_titles])
+            response += f"🗑️ Deleted: {titles_str}"
+            logger.info(f"Batch deleted reminders: {deleted_titles}")
+        
+        if invalid_indices:
+            if response:
+                response += "\n\n"
+            response += f"⚠️ Invalid numbers: {invalid_indices}. Use 'list reminders' to see valid numbers."
+        
+        return response if response else "No reminders were deleted."
+    
+    async def _handle_get_info(self, intent: ParsedIntent) -> str:
+        """Handle get reminder info intent (asking about time, details)."""
+        if not intent.target_reminder:
+            return "Which reminder would you like info about? Please mention its name."
+        
+        reminder = await self._find_reminder_by_keyword(intent.target_reminder)
+        if not reminder:
+            return f"I couldn't find a reminder matching '{intent.target_reminder}'. Try 'list my reminders' to see your reminders."
+        
+        response = f"📌 *{reminder.title}*\n\n"
+        response += f"⏰ Scheduled for: {format_time_pkt(reminder.scheduled_time, include_date=True)}\n"
+        response += f"📅 {get_relative_time_description(reminder.scheduled_time)}\n"
+        
+        if reminder.description:
+            response += f"📝 Description: {reminder.description}\n"
+        
+        status_text = "Active" if reminder.status == ReminderStatus.ACTIVE else "Paused"
+        response += f"📊 Status: {status_text}\n"
+        
+        if reminder.call_if_no_response and not reminder.call_opt_out:
+            response += f"📞 Will call if no response"
+            if reminder.follow_up_minutes:
+                response += f" after {reminder.follow_up_minutes} minutes"
+        
+        return response
+    
+    async def _handle_snooze(self, intent: ParsedIntent) -> str:
+        """Handle snooze/remind later intent."""
+        # Try to find the target reminder
+        reminder = None
+        
+        # First check if there's a target_reminder specified
+        if intent.target_reminder:
+            reminder = await self._find_reminder_by_keyword(intent.target_reminder)
+        
+        # If target_indices specified, use that
+        if not reminder and intent.target_indices and len(intent.target_indices) > 0:
+            result = await self.session.execute(
+                select(Reminder)
+                .where(Reminder.status.in_([ReminderStatus.ACTIVE, ReminderStatus.PAUSED]))
+                .order_by(Reminder.scheduled_time)
+            )
+            reminders = result.scalars().all()
+            idx = intent.target_indices[0]
+            if isinstance(idx, int) and 1 <= idx <= len(reminders):
+                reminder = reminders[idx - 1]
+        
+        # If still no reminder, try to find the most recently notified one
+        if not reminder:
+            result = await self.session.execute(
+                select(Reminder)
+                .where(
+                    Reminder.status == ReminderStatus.ACTIVE,
+                    Reminder.last_notified_at.isnot(None),
+                    Reminder.user_responded == False
+                )
+                .order_by(Reminder.last_notified_at.desc())
+                .limit(1)
+            )
+            reminder = result.scalar_one_or_none()
+        
+        if not reminder:
+            return "I'm not sure which reminder you want to snooze. Please specify the reminder name or number."
+        
+        # Determine new time
+        new_time = intent.scheduled_time
+        if not new_time:
+            # Default snooze: 30 minutes from now
+            new_time = get_current_time_pkt() + timedelta(minutes=30)
+        
+        # Update the reminder
+        old_time = reminder.scheduled_time
+        reminder.scheduled_time = to_pkt(new_time)
+        reminder.user_responded = True  # Mark as responded
+        reminder.updated_at = datetime.utcnow()
+        
+        # Reschedule
+        await cancel_reminder_jobs(reminder.id)
+        reminder.status = ReminderStatus.ACTIVE
+        await self.session.commit()
+        await schedule_reminder(reminder)
+        
+        return f"⏰ Snoozed *{reminder.title}*\n\nNew time: {format_time_pkt(reminder.scheduled_time, include_date=True)}\n📅 ({get_relative_time_description(reminder.scheduled_time)})"
+    
+    async def get_reminders_list(self) -> List[Reminder]:
+        """Get list of active/paused reminders ordered by scheduled time."""
+        result = await self.session.execute(
+            select(Reminder)
+            .where(Reminder.status.in_([ReminderStatus.ACTIVE, ReminderStatus.PAUSED]))
+            .order_by(Reminder.scheduled_time)
+        )
+        return result.scalars().all()
+

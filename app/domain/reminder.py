@@ -92,4 +92,5 @@ class ParsedIntent(BaseModel):
     follow_up_minutes: Optional[int] = None
     call_if_no_response: Optional[bool] = None
     target_reminder: Optional[str] = None  # For update/delete operations
+    target_indices: Optional[list] = None  # For numbered references like "delete 1 & 2"
     response_message: str = ""  # Message to send back to user

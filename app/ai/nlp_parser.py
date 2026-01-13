@@ -1,11 +1,12 @@
 """
 OpenAI-powered NLP parser for intent detection and entity extraction.
+Supports conversation history for context-aware responses.
 """
 
 import json
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from openai import AsyncOpenAI, APIError, APITimeoutError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -25,23 +26,41 @@ SYSTEM_PROMPT = """You are an AI assistant that parses WhatsApp messages about r
 Your task is to extract the user's intent and relevant entities from their message.
 
 Current date and time in Pakistan (PKT): {current_time}
+Current day of week: {current_day}
+
+IMPORTANT DATE RULES:
+1. "Monday" (without "next") means the UPCOMING Monday - the closest Monday in the future
+2. "next Monday" means the Monday AFTER the upcoming Monday
+3. "this Monday" means the upcoming Monday
+4. Always prefer the closest future occurrence for day names
+5. If today is Sunday and user says "Monday", it means TOMORROW (the upcoming Monday)
 
 IMPORTANT RULES:
 1. Output ONLY valid JSON, nothing else
 2. All times should be in ISO 8601 format with Pakistan timezone (+05:00)
 3. For relative times like "tomorrow at 9am", calculate the actual datetime
 4. Be flexible with natural language - users may not be precise
+5. Use conversation history to understand context and follow-up questions
+6. When user refers to "it", "that", "the reminder", look at recent context
+
+NUMBERED REFERENCES:
+- When user says "delete 1 and 2" or "delete 1 & 2" after listing reminders, they mean reminders by list position
+- Use target_indices array for numbered references: [1, 2] means first and second reminder
+- "remind me about 3 later" means snooze/reschedule the 3rd reminder from the list
 
 Possible intents:
 - create_reminder: User wants to create a new reminder
 - update_reminder: User wants to modify an existing reminder
-- delete_reminder: User wants to remove a reminder
+- delete_reminder: User wants to remove a reminder (single)
+- delete_reminders: User wants to remove multiple reminders (use target_indices)
 - pause_reminder: User wants to pause a reminder
 - resume_reminder: User wants to resume a paused reminder
 - list_reminders: User wants to see their reminders
+- get_reminder_info: User is asking about a specific reminder's details (time, title, etc.)
 - opt_out_calls: User wants to disable phone calls for reminders
 - opt_in_calls: User wants to enable phone calls for reminders
 - acknowledge: User is acknowledging/responding to a reminder
+- snooze_reminder: User wants to be reminded later about something
 - unknown: Cannot determine the intent
 
 Output JSON schema:
@@ -53,17 +72,29 @@ Output JSON schema:
   "follow_up_minutes": "integer or null (minutes to wait before follow-up)",
   "call_if_no_response": "boolean or null (whether to call if no response)",
   "target_reminder": "string or null (title/keyword to identify existing reminder for update/delete)",
+  "target_indices": "array of integers or null (for numbered references like 'delete 1 & 2')",
   "response_message": "string (friendly message to send back to user)"
 }}
 
 Examples:
 - "Remind me to pay electricity bill tomorrow at 9am" → create_reminder
+- "Monday 5pm call mom" (on Sunday) → create_reminder for TOMORROW (upcoming Monday)
 - "Remind me to call Mark before 7pm. If I don't respond, call me." → create_reminder with call_if_no_response=true
 - "Pause my wifi reminder" → pause_reminder with target_reminder="wifi"
 - "Delete Mark reminder" → delete_reminder with target_reminder="mark"
+- "Delete 1 and 2" or "delete 1 & 2" → delete_reminders with target_indices=[1,2]
+- "What time is the Jds reminder?" → get_reminder_info with target_reminder="Jds"
 - "Do not call me if I don't respond" → opt_out_calls
 - "List my reminders" → list_reminders
 - "ok" or "done" or "thanks" → acknowledge
+- "remind me about this later" → snooze_reminder
+{quoted_context}"""
+
+# Quoted message context template
+QUOTED_CONTEXT_TEMPLATE = """
+QUOTED MESSAGE CONTEXT:
+The user is replying to this previous message: "{quoted_message}"
+Use this context to understand what the user is referring to.
 """
 
 
@@ -94,32 +125,55 @@ async def _call_openai_chat(messages: list, response_format: dict) -> str:
     return response.choices[0].message.content
 
 
-async def parse_user_message(message: str) -> ParsedIntent:
+async def parse_user_message(
+    message: str,
+    conversation_history: Optional[List[dict]] = None,
+    quoted_message: Optional[str] = None
+) -> ParsedIntent:
     """
     Parse a user message to extract intent and entities.
     
     Args:
         message: The user's message text
+        conversation_history: Optional list of previous messages for context
+        quoted_message: Optional quoted/replied-to message for context
     
     Returns:
         ParsedIntent object with extracted information
     """
     current_time = get_current_time_pkt()
     
+    # Build quoted context section
+    quoted_context = ""
+    if quoted_message:
+        quoted_context = QUOTED_CONTEXT_TEMPLATE.format(quoted_message=quoted_message)
+    
+    # Build messages array with history
+    messages = []
+    
+    # System prompt
+    messages.append({
+        "role": "system",
+        "content": SYSTEM_PROMPT.format(
+            current_time=current_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            current_day=current_time.strftime("%A"),
+            quoted_context=quoted_context
+        )
+    })
+    
+    # Add conversation history for context (last 10 exchanges)
+    if conversation_history:
+        messages.extend(conversation_history[-20:])  # 10 exchanges = 20 messages
+    
+    # Current user message
+    messages.append({
+        "role": "user",
+        "content": message
+    })
+    
     try:
         result_text = await _call_openai_chat(
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT.format(
-                        current_time=current_time.strftime("%Y-%m-%d %H:%M:%S %Z")
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": message
-                }
-            ],
+            messages=messages,
             response_format={"type": "json_object"}
         )
         
@@ -138,6 +192,11 @@ async def parse_user_message(message: str) -> ParsedIntent:
                 # Try natural language parsing as fallback
                 scheduled_time = parse_natural_time(result["scheduled_time"])
         
+        # Parse target_indices
+        target_indices = result.get("target_indices")
+        if target_indices and not isinstance(target_indices, list):
+            target_indices = None
+        
         return ParsedIntent(
             intent=result.get("intent", "unknown"),
             title=result.get("title"),
@@ -146,6 +205,7 @@ async def parse_user_message(message: str) -> ParsedIntent:
             follow_up_minutes=result.get("follow_up_minutes"),
             call_if_no_response=result.get("call_if_no_response"),
             target_reminder=result.get("target_reminder"),
+            target_indices=target_indices,
             response_message=result.get("response_message", "I understood your message.")
         )
         

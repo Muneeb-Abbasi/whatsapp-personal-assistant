@@ -1,10 +1,11 @@
 """
 WhatsApp webhook endpoint for receiving messages from Twilio.
+Supports conversation history and quoted message context.
 """
 
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 from fastapi import APIRouter, Request, Form, HTTPException
 from fastapi.responses import Response
 from twilio.request_validator import RequestValidator
@@ -17,6 +18,11 @@ from app.infrastructure.audio_handler import download_and_transcribe_audio
 from app.ai.nlp_parser import parse_user_message
 from app.usecases.reminder_service import ReminderService
 from app.domain.processed_message import ProcessedMessage
+from app.domain.conversation_history import (
+    ConversationMessage,
+    save_conversation,
+    get_conversation_history
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -118,12 +124,15 @@ async def whatsapp_webhook(
     NumMedia: str = Form(default="0"),
     MediaUrl0: Optional[str] = Form(default=None),
     MediaContentType0: Optional[str] = Form(default=None),
+    # Quoted message fields (when user replies to a specific message)
+    QuotedBody: Optional[str] = Form(default=None),
 ):
     """
     Handle incoming WhatsApp messages from Twilio.
     
     This endpoint processes both text and audio messages.
     Audio messages are transcribed using OpenAI before processing.
+    Supports conversation history and quoted message context.
     """
     # Note: Cannot read request.body() here as Form() already consumed the stream
     # Signature validation is skipped when VALIDATE_TWILIO_SIGNATURE=false
@@ -169,13 +178,34 @@ async def whatsapp_webhook(
             logger.info("Empty message received, skipping")
             return Response(content="", media_type="text/xml")
         
-        # Parse the message using NLP
-        parsed_intent = await parse_user_message(message_text)
+        # Get conversation history for context (last 10 exchanges)
+        conversation_history: List[dict] = []
+        async with async_session_factory() as session:
+            conversation_history = await get_conversation_history(session, limit=10)
+        
+        # Log quoted message if present (for debugging)
+        if QuotedBody:
+            logger.info(f"User replied to message: {QuotedBody[:100]}...")
+        
+        # Parse the message using NLP with context
+        parsed_intent = await parse_user_message(
+            message=message_text,
+            conversation_history=conversation_history,
+            quoted_message=QuotedBody
+        )
         
         # Process the intent
         async with DatabaseSession() as session:
             service = ReminderService(session)
             response = await service.handle_intent(parsed_intent)
+        
+        # Save conversation to history for future context
+        async with async_session_factory() as session:
+            await save_conversation(
+                session=session,
+                user_message=message_text,
+                bot_response=response
+            )
         
         # Send response back to user
         await send_whatsapp_message(response)
