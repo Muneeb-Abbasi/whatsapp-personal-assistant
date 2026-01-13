@@ -64,24 +64,68 @@ def parse_natural_time(time_str: str, reference_time: datetime = None) -> Option
     if reference_time is None:
         reference_time = get_current_time_pkt()
     
-    time_str = time_str.lower().strip()
+    time_str_lower = time_str.lower().strip()
     
-    # Handle relative day expressions
+    # Day name mapping (Monday=0, Sunday=6)
+    day_names = {
+        'monday': 0, 'mon': 0,
+        'tuesday': 1, 'tue': 1, 'tues': 1,
+        'wednesday': 2, 'wed': 2,
+        'thursday': 3, 'thu': 3, 'thur': 3, 'thurs': 3,
+        'friday': 4, 'fri': 4,
+        'saturday': 5, 'sat': 5,
+        'sunday': 6, 'sun': 6
+    }
+    
+    # Check for day names in the string
     day_offset = 0
-    time_part = time_str
+    time_part = time_str_lower
+    found_day = False
+    is_next_week = 'next ' in time_str_lower
     
-    if "tomorrow" in time_str:
-        day_offset = 1
-        time_part = time_str.replace("tomorrow", "").strip()
-    elif "day after tomorrow" in time_str:
-        day_offset = 2
-        time_part = time_str.replace("day after tomorrow", "").strip()
-    elif "today" in time_str:
-        day_offset = 0
-        time_part = time_str.replace("today", "").strip()
-    elif "next week" in time_str:
-        day_offset = 7
-        time_part = time_str.replace("next week", "").strip()
+    # Remove "next" for parsing
+    check_str = time_str_lower.replace('next ', '')
+    
+    for day_name, target_weekday in day_names.items():
+        # Check if day name is in the string (as a word boundary)
+        pattern = r'\b' + day_name + r'\b'
+        if re.search(pattern, check_str):
+            current_weekday = reference_time.weekday()
+            
+            # Calculate days until target day
+            days_ahead = (target_weekday - current_weekday) % 7
+            
+            # If it's today (days_ahead=0) and we want the UPCOMING one, go to next week
+            if days_ahead == 0:
+                days_ahead = 7
+            
+            # If "next" was specified, add another week
+            if is_next_week:
+                days_ahead += 7
+            
+            day_offset = days_ahead
+            # Remove the day name from time_part
+            time_part = re.sub(pattern, '', check_str)
+            time_part = time_part.replace('next', '').strip()
+            found_day = True
+            break
+    
+    # Handle relative day expressions (only if no day name found)
+    if not found_day:
+        time_part = time_str_lower
+        
+        if "tomorrow" in time_str_lower:
+            day_offset = 1
+            time_part = time_str_lower.replace("tomorrow", "").strip()
+        elif "day after tomorrow" in time_str_lower:
+            day_offset = 2
+            time_part = time_str_lower.replace("day after tomorrow", "").strip()
+        elif "today" in time_str_lower:
+            day_offset = 0
+            time_part = time_str_lower.replace("today", "").strip()
+        elif "next week" in time_str_lower:
+            day_offset = 7
+            time_part = time_str_lower.replace("next week", "").strip()
     
     # Clean up common words
     time_part = time_part.replace("at", "").replace("on", "").strip()

@@ -209,13 +209,23 @@ async def parse_user_message(
         logger.info(f"Parsed intent: {result.get('intent')}")
         logger.debug(f"Full parse result: {result}")
         
-        # Convert scheduled_time string to datetime if present
+        # Convert scheduled_time - PREFER Python parsing over GPT's calculation
         scheduled_time = None
-        if result.get("scheduled_time"):
+        
+        # First, try to parse the time from the ORIGINAL user message using Python
+        # This is more reliable than GPT's date calculation for day names
+        python_parsed = parse_natural_time(message)
+        
+        if python_parsed:
+            scheduled_time = python_parsed
+            logger.info(f"Using Python-parsed time: {scheduled_time}")
+        elif result.get("scheduled_time"):
+            # Fallback to GPT's parsed time
             try:
                 scheduled_time = datetime.fromisoformat(result["scheduled_time"])
+                logger.info(f"Using GPT-parsed time: {scheduled_time}")
             except ValueError:
-                # Try natural language parsing as fallback
+                # Try natural language parsing as last resort
                 scheduled_time = parse_natural_time(result["scheduled_time"])
         
         # Parse target_indices
